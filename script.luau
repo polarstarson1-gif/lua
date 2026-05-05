@@ -1,4 +1,4 @@
--- Roblox: sulfurmelt | Discord: omorune (1136974289053159456)
+-- Roblox: sulfurmelt | Discord: omorune
 -- Gold Collection System: DataStore with session locks, metatable data wrapper, leaderstats, and physics respawn
 -- Main components interact: loadPlayer -> acquireLock -> getData -> PlayerData -> makeLeaderstats -> gold touch -> savePlayer
 
@@ -15,6 +15,11 @@ local backupStore = DataStoreService:GetDataStore("PlayerGoldBackup")
 -- remote
 -- used to sync gold to client UI, server remains authoritative
 local updateGold = ReplicatedStorage:WaitForChild("UpdateGold", 10)
+if not updateGold then
+	updateGold = Instance.new("RemoteEvent")
+	updateGold.Name = "UpdateGold"
+	updateGold.Parent = ReplicatedStorage
+end
 
 -- workspace objects
 local ballsFolder = workspace:WaitForChild("Balls", 10)
@@ -31,6 +36,8 @@ end
 -- setup gold part
 goldPart.CanCollide = false
 goldPart.Anchored = true
+goldPart.CanTouch = true
+goldPart.CanQuery = false
 
 -- config
 local SPAWN_HEIGHT = 10
@@ -75,15 +82,16 @@ end
 local function acquireLock(userId)
 	local key = "lock_"..userId
 	local now = os.time()
+	local newExpiry = now + LOCK_TIME
 	local ok, result = pcall(function()
 		return mainStore:UpdateAsync(key, function(old)
 			if not old or old < now then
-				return now + LOCK_TIME
+				return newExpiry
 			end
 			return nil
 		end)
 	end)
-	if ok and result and result > now then
+	if ok and result == newExpiry then
 		sessionLocks[userId] = true
 		return true
 	end
@@ -100,6 +108,7 @@ end
 -- refresh session lock
 -- extends lock during long play sessions
 local function refreshLock(userId)
+	if not sessionLocks[userId] then return end
 	pcall(function()
 		mainStore:UpdateAsync("lock_"..userId, function(old)
 			if old then return os.time() + LOCK_TIME end
@@ -114,8 +123,12 @@ local function getData(userId)
 	local key = "data_"..userId
 	for i = 1, MAX_RETRIES do
 		local ok, data = pcall(function() return mainStore:GetAsync(key) end)
-		if ok then return data end
+		if ok and data then return data end
 		task.wait(0.5)
+	end
+	local ok, backup = pcall(function() return backupStore:GetAsync(key) end)
+	if ok and backup then
+		return backup
 	end
 	return nil
 end
@@ -125,9 +138,11 @@ local function saveData(userId, data)
 	local key = "data_"..userId
 	-- save main
 	for i = 1, MAX_RETRIES do
-		local ok = pcall(function() mainStore:SetAsync(key, data) end)
+		local ok = pcall(function()
+			mainStore:UpdateAsync(key, function() return data end)
+		end)
 		if ok then break end
-		task.wait(0.5)
+		task.wait(1)
 	end
 	-- save backup
 	pcall(function() backupStore:SetAsync(key, data) end)
@@ -148,8 +163,8 @@ end
 -- ensures older saves get missing fields without wiping progress
 local function migrate(old)
 	if type(old) ~= "table" then old = {} end
-	old.Gold = old.Gold or 0
-	old.TotalCollected = old.TotalCollected or old.Gold
+	old.Gold = tonumber(old.Gold) or 0
+	old.TotalCollected = tonumber(old.TotalCollected) or old.Gold
 	old.LastLogin = os.time()
 	old.SessionStart = old.SessionStart or os.time()
 	old.Version = DATA_VERSION
@@ -184,6 +199,10 @@ local function loadPlayer(player)
 			player:Kick("Data open elsewhere")
 			return
 		end
+		if not player:IsDescendantOf(Players) then
+			releaseLock(userId)
+			return
+		end
 		-- load data
 		local raw = getData(userId)
 		-- use saved or default
@@ -194,7 +213,7 @@ local function loadPlayer(player)
 		-- setup stats
 		makeLeaderstats(player, data)
 		-- send gold to client
-		updateGold:FireClient(player, data.Gold)
+		pcall(function() updateGold:FireClient(player, data.Gold) end)
 	end)
 end
 
@@ -233,6 +252,16 @@ task.spawn(function()
 	end
 end)
 
+-- keep session locks alive
+task.spawn(function()
+	while true do
+		task.wait(60)
+		for userId in pairs(sessionLocks) do
+			refreshLock(userId)
+		end
+	end
+end)
+
 -- gold touch
 -- validates ball, checks distance/speed, awards gold, respawns with CFrame math
 goldPart.Touched:Connect(function(hit)
@@ -240,15 +269,22 @@ goldPart.Touched:Connect(function(hit)
 	if not hit or not hit:IsA("BasePart") then return end
 	-- must be in balls folder
 	if not ballsFolder or not hit:IsDescendantOf(ballsFolder) then return end
-	-- get player from ball name
-	local player = Players:FindFirstChild(hit.Name)
+	-- get player from ball attribute or name
+	local ownerId = hit:GetAttribute("OwnerId")
+	local player = ownerId and Players:GetPlayerByUserId(ownerId)
+	if not player then
+		player = Players:FindFirstChild(hit.Name)
+		if player then
+			hit:SetAttribute("OwnerId", player.UserId)
+		end
+	end
 	if not player then return end
 	local userId = player.UserId
 	local data = playerData[userId]
 	if not data then return end
 	-- debounce 1 second
 	local now = os.clock()
-	if lastTouch[userId] and now - lastTouch[userId] < 1 then return end
+	if lastTouch[hit] and now - lastTouch[hit] < 1 then return end
 	-- distance check
 	if (hit.Position - goldPart.Position).Magnitude > 35 then return end
 	-- speed check
@@ -256,7 +292,7 @@ goldPart.Touched:Connect(function(hit)
 	-- anchored check
 	if hit.Anchored then return end
 	-- update last touch
-	lastTouch[userId] = now
+	lastTouch[hit] = now
 	-- add gold using metatable method
 	data:AddGold(10)
 	-- update leaderstats
@@ -266,11 +302,12 @@ goldPart.Touched:Connect(function(hit)
 		ls.Total.Value = data.TotalCollected
 	end
 	-- update client
-	updateGold:FireClient(player, data.Gold)
+	pcall(function() updateGold:FireClient(player, data.Gold) end)
 	-- reset ball with CFrame math and physics
 	local char = player.Character
 	local hrp = char and char:FindFirstChild("HumanoidRootPart")
 	if hrp then
+		pcall(function() hit:SetNetworkOwner(nil) end)
 		-- stop motion
 		hit.AssemblyLinearVelocity = Vector3.zero
 		hit.AssemblyAngularVelocity = Vector3.zero
@@ -289,6 +326,7 @@ end)
 game:BindToClose(function()
 	-- save all players
 	for _, plr in ipairs(Players:GetPlayers()) do
-		savePlayer(plr, true)
+		task.spawn(savePlayer, plr, true)
 	end
+	task.wait(3)
 end)
