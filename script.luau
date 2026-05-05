@@ -1,13 +1,19 @@
+-- Roblox: sulfurmelt | Discord: omorune (1136974289053159456)
+-- Gold Collection System: DataStore with session locks, metatable data wrapper, leaderstats, and physics respawn
+-- Main components interact: loadPlayer -> acquireLock -> getData -> PlayerData -> makeLeaderstats -> gold touch -> savePlayer
+
 -- services
 local Players = game:GetService("Players")
 local DataStoreService = game:GetService("DataStoreService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 -- data stores
+-- mainStore is primary save, backupStore is redundancy in case main write fails
 local mainStore = DataStoreService:GetDataStore("PlayerGoldV1")
 local backupStore = DataStoreService:GetDataStore("PlayerGoldBackup")
 
 -- remote
+-- used to sync gold to client UI, server remains authoritative
 local updateGold = ReplicatedStorage:WaitForChild("UpdateGold", 10)
 
 -- workspace objects
@@ -39,6 +45,7 @@ local lastTouch = {}
 local sessionLocks = {}
 
 -- PlayerData class using metatable (open source OOP pattern.)
+-- metatable keeps methods out of saved data, DataStore only stores plain values
 local PlayerData = {}
 PlayerData.__index = PlayerData
 
@@ -64,6 +71,7 @@ function PlayerData:ToSave()
 end
 
 -- take session lock
+-- UpdateAsync is atomic, prevents two servers from owning the same profile
 local function acquireLock(userId)
 	local key = "lock_"..userId
 	local now = os.time()
@@ -90,6 +98,7 @@ local function releaseLock(userId)
 end
 
 -- refresh session lock
+-- extends lock during long play sessions
 local function refreshLock(userId)
 	pcall(function()
 		mainStore:UpdateAsync("lock_"..userId, function(old)
@@ -100,6 +109,7 @@ local function refreshLock(userId)
 end
 
 -- load data from datastore
+-- retries handle temporary Roblox datastore outages
 local function getData(userId)
 	local key = "data_"..userId
 	for i = 1, MAX_RETRIES do
@@ -135,6 +145,7 @@ local function defaultData()
 end
 
 -- migrate old data format
+-- ensures older saves get missing fields without wiping progress
 local function migrate(old)
 	if type(old) ~= "table" then old = {} end
 	old.Gold = old.Gold or 0
@@ -212,6 +223,7 @@ Players.PlayerAdded:Connect(loadPlayer)
 Players.PlayerRemoving:Connect(function(p) savePlayer(p, true) end)
 
 -- autosave loop
+-- background saves reduce loss if server crashes
 task.spawn(function()
 	while true do
 		task.wait(AUTOSAVE)
@@ -222,6 +234,7 @@ task.spawn(function()
 end)
 
 -- gold touch
+-- validates ball, checks distance/speed, awards gold, respawns with CFrame math
 goldPart.Touched:Connect(function(hit)
 	-- must be basepart
 	if not hit or not hit:IsA("BasePart") then return end
@@ -272,6 +285,7 @@ goldPart.Touched:Connect(function(hit)
 end)
 
 -- shutdown
+-- BindToClose guarantees final save when server closes
 game:BindToClose(function()
 	-- save all players
 	for _, plr in ipairs(Players:GetPlayers()) do
